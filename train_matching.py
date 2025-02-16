@@ -8,7 +8,7 @@ from datetime import timedelta
 from os.path import join, exists
 from torch.optim import Adam
 
-from utils import read_jsonl, get_data_path, get_result_path
+from utils import read_jsonl, get_result_path
 
 from dataloader import MatchSumPipe
 from model import MatchSum
@@ -18,44 +18,77 @@ from fastNLP.core.trainer import Trainer
 from fastNLP.core.tester import Tester
 from fastNLP.core.callback import SaveModelCallback
 
+from datasets import load_dataset
+
+def load_huggingface_dataset():
+    # Load the dataset from Hugging Face
+    dataset = load_dataset("percins/IN-ABS")
+    
+    # Save the dataset to disk in JSON lines format with required schema
+    data_paths = {
+        "train": "/content/data/train.json",
+        "validation": "/content/data/validation.json",
+        "test": "/content/data/test.json"
+    }
+    
+    os.makedirs("/content/data", exist_ok=True)
+    
+    for split, path in data_paths.items():
+        # Convert the Dataset object to a list of dictionaries
+        data = dataset[split].to_list()
+        
+        # Save each example as a separate JSON line with the required schema
+        with open(path, "w") as f:
+            for example in data:
+                formatted_example = {
+                    "src": example["text"],  # Use "src" instead of "article"
+                    "candidates": [example["summary"]]  # Wrap the summary in a list
+                }
+                json.dump(formatted_example, f)
+                f.write('\n')  # Add a newline after each JSON object
+    
+    return data_paths
+
 def configure_training(args):
     devices = [int(gpu) for gpu in args.gpus.split(',')]
     params = {}
-    params['encoder']       = args.encoder
+    params['encoder'] = args.encoder
     params['candidate_num'] = args.candidate_num
-    params['batch_size']    = args.batch_size
-    params['accum_count']   = args.accum_count
-    params['max_lr']        = args.max_lr
-    params['margin']        = args.margin
-    params['warmup_steps']  = args.warmup_steps
-    params['n_epochs']      = args.n_epochs
-    params['valid_steps']   = args.valid_steps
+    params['batch_size'] = args.batch_size
+    params['accum_count'] = args.accum_count
+    params['max_lr'] = args.max_lr
+    params['margin'] = args.margin
+    params['warmup_steps'] = args.warmup_steps
+    params['n_epochs'] = args.n_epochs
+    params['valid_steps'] = args.valid_steps
     return devices, params
 
 def train_model(args):
+    # Load the dataset from Hugging Face and save it to disk
+    data_paths = load_huggingface_dataset()
     
-    # check if the data_path and save_path exists
-    data_paths = get_data_path(args.mode, args.encoder)
+    # Check if the data paths exist
     for name in data_paths:
-        assert exists(data_paths[name])
+        assert exists(data_paths[name]), f"Path does not exist: {data_paths[name]}"
+    
     if not exists(args.save_path):
         os.makedirs(args.save_path)
     
-    # load summarization datasets
+    # Load summarization datasets
     datasets = MatchSumPipe(args.candidate_num, args.encoder).process_from_file(data_paths)
     print('Information of dataset is:')
     print(datasets)
     train_set = datasets.datasets['train']
-    valid_set = datasets.datasets['val']
+    valid_set = datasets.datasets['validation']
     
-    # configure training
+    # Configure training
     devices, train_params = configure_training(args)
     with open(join(args.save_path, 'params.json'), 'w') as f:
         json.dump(train_params, f, indent=4)
     print('Devices is:')
     print(devices)
 
-    # configure model
+    # Configure model
     model = MatchSum(args.candidate_num, args.encoder)
     optimizer = Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=0)
     
@@ -63,7 +96,7 @@ def train_model(args):
                  SaveModelCallback(save_dir=args.save_path, top=5)]
     
     criterion = MarginRankingLoss(args.margin)
-    val_metric = [ValidMetric(save_path=args.save_path, data=read_jsonl(data_paths['val']))]
+    val_metric = [ValidMetric(save_path=args.save_path, data=read_jsonl(data_paths['validation']))]
     
     assert args.batch_size % len(devices) == 0
     
@@ -78,34 +111,33 @@ def train_model(args):
     print(train_params)
     trainer.train()
 
-
 def test_model(args):
-
+    # Load the dataset from Hugging Face and save it to disk
+    data_paths = load_huggingface_dataset()
+    
     models = os.listdir(args.save_path)
     
-    # load dataset
-    data_paths = get_data_path(args.mode, args.encoder)
+    # Load dataset
     datasets = MatchSumPipe(args.candidate_num, args.encoder).process_from_file(data_paths)
     print('Information of dataset is:')
     print(datasets)
     test_set = datasets.datasets['test']
     
-    # need 1 gpu for testing
+    # Need 1 GPU for testing
     device = int(args.gpus)
     
     args.batch_size = 1
 
     for cur_model in models:
-        
         print('Current model is {}'.format(cur_model))
 
-        # load model
+        # Load model
         model = torch.load(join(args.save_path, cur_model))
     
-        # configure testing
+        # Configure testing
         dec_path, ref_path = get_result_path(args.save_path, cur_model)
         test_metric = MatchRougeMetric(data=read_jsonl(data_paths['test']), dec_path=dec_path, 
-                                  ref_path=ref_path, n_total = len(test_set))
+                                  ref_path=ref_path, n_total=len(test_set))
         tester = Tester(data=test_set, model=model, metrics=[test_metric], 
                         batch_size=args.batch_size, device=device, use_tqdm=False)
         tester.test()
@@ -116,19 +148,16 @@ if __name__ == '__main__':
     )
     parser.add_argument('--mode', required=True,
                         help='training or testing of MatchSum', type=str)
-
     parser.add_argument('--save_path', required=True,
                         help='root of the model', type=str)
-    # example for gpus input: '0,1,2,3'
     parser.add_argument('--gpus', required=True,
-                        help='available gpus for training(separated by commas)', type=str)
+                        help='available gpus for training (separated by commas)', type=str)
     parser.add_argument('--encoder', required=True,
                         help='the encoder for matchsum (bert/roberta)', type=str)
-
     parser.add_argument('--batch_size', default=16,
                         help='the training batch size', type=int)
     parser.add_argument('--accum_count', default=2,
-                        help='number of updates steps to accumulate before performing a backward/update pass', type=int)
+                        help='number of updates steps to accumulate', type=int)
     parser.add_argument('--candidate_num', default=20,
                         help='number of candidates summaries', type=int)
     parser.add_argument('--max_lr', default=2e-5,
@@ -140,7 +169,7 @@ if __name__ == '__main__':
     parser.add_argument('--n_epochs', default=5,
                         help='total number of training epochs', type=int)
     parser.add_argument('--valid_steps', default=1000,
-                        help='number of update steps for validation and saving checkpoint', type=int)
+                        help='steps for validation and saving checkpoint', type=int)
 
     args = parser.parse_known_args()[0]
     
@@ -150,4 +179,3 @@ if __name__ == '__main__':
     else:
         print('Testing process of MatchSum !!!')
         test_model(args)
-
