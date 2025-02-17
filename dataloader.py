@@ -21,42 +21,49 @@ class MatchSumLoader(JsonLoader):
         self.pad_token_id = self.tokenizer.pad_token_id
 
     def _load(self, path):
-        data = []
-        with open(path, "r") as f:
-            for line in f:
-                example = json.loads(line)
-                src = example["src"]
-                candidates = example["candidates"][:self.candidate_num]
-                
-                # Tokenize and pad article
-                src_ids = self.tokenizer.encode(
-                    src, 
-                    max_length=self.max_len,
-                    truncation=True,
-                    padding='max_length',
-                    add_special_tokens=True
-                )
-                
-                # Tokenize and pad candidates
-                candidate_ids = []
-                for cand in candidates:
-                    cand_ids = self.tokenizer.encode(
-                        cand, 
-                        max_length=self.max_len,
-                        truncation=True,
-                        padding='max_length',
-                        add_special_tokens=True
-                    )
-                    candidate_ids.append(cand_ids)
-                
-                instance = Instance(
-                    text_id=src_ids,
-                    candidate_id=candidate_ids,
-                    summary_id=candidate_ids[0]
-                )
-                data.append(instance)
-        
-        return DataSet(data)
+      data = []
+      with open(path, "r") as f:
+          for line in f:
+              example = json.loads(line)
+              src = example["src"]
+              candidates = example["candidates"][:self.candidate_num]
+              
+              # Generate indices for candidates [0, 1, ..., candidate_num-1]
+              indices = list(range(len(candidates)))
+              
+              # Tokenize and pad article
+              src_ids = self.tokenizer.encode(
+                  src, 
+                  max_length=self.max_len,
+                  truncation=True,
+                  padding='max_length',
+                  add_special_tokens=True
+              )
+            
+              # Tokenize and pad candidates
+              candidate_ids = []
+              for cand in candidates:
+                  cand_ids = self.tokenizer.encode(
+                      cand, 
+                      max_length=self.max_len,
+                      truncation=True,
+                      padding='max_length',
+                      add_special_tokens=True
+                  )
+                  candidate_ids.append(cand_ids)
+              
+              # Create Instance with indices
+              instance = Instance(
+                  text_id=src_ids,
+                  candidate_id=candidate_ids,
+                  summary_id=candidate_ids[0],  # Assume first candidate is ground truth
+                  indices=indices,  # Add indices
+                  text=src,  # Store raw text for metrics
+                  summary=candidates[0]  # Store raw summary for metrics
+              )
+              data.append(instance)
+      
+      return DataSet(data)
 
     def load(self, paths):
         print('Start loading datasets !!!')
@@ -66,7 +73,7 @@ class MatchSumLoader(JsonLoader):
         for name in paths:
             dataset = self._load(paths[name])
             
-            dataset.set_input("text_id", "candidate_id")
+            dataset.set_input("text_id", "candidate_id", "summary_id")
             dataset.set_target("summary_id")
             
             dataset.set_pad_val("text_id", self.pad_token_id)
