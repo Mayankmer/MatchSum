@@ -38,7 +38,7 @@ def load_huggingface_dataset():
             for example in data:
                 # Include raw text and summary for metrics
                 formatted_example = {
-                    "src": example["article"],
+                    "src": example["text"],
                     "candidates": example["candidates"],  # List of candidate summaries
                     "summary": example["summary"]  # Ground truth summary
                 }
