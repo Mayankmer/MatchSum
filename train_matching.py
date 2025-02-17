@@ -21,10 +21,8 @@ from fastNLP.core.callback import SaveModelCallback
 from datasets import load_dataset
 
 def load_huggingface_dataset():
-    # Load the dataset from Hugging Face
     dataset = load_dataset("percins/IN-ABS")
     
-    # Save the dataset to disk in JSON lines format with required schema
     data_paths = {
         "train": "/content/data/train.json",
         "validation": "/content/data/validation.json",
@@ -34,18 +32,18 @@ def load_huggingface_dataset():
     os.makedirs("/content/data", exist_ok=True)
     
     for split, path in data_paths.items():
-        # Convert the Dataset object to a list of dictionaries
         data = dataset[split].to_list()
         
-        # Save each example as a separate JSON line with the required schema
         with open(path, "w") as f:
             for example in data:
+                # Include raw text and summary for metrics
                 formatted_example = {
-                    "src": example["text"],  # Use "src" instead of "article"
-                    "candidates": [example["summary"]]  # Wrap the summary in a list
+                    "src": example["article"],
+                    "candidates": example["candidates"],  # List of candidate summaries
+                    "summary": example["summary"]  # Ground truth summary
                 }
                 json.dump(formatted_example, f)
-                f.write('\n')  # Add a newline after each JSON object
+                f.write('\n')
     
     return data_paths
 
