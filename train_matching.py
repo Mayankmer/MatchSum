@@ -17,12 +17,17 @@ from callback import MyCallback
 from fastNLP.core.trainer import Trainer
 from fastNLP.core.tester import Tester
 from fastNLP.core.callback import SaveModelCallback
+from nltk.tokenize import sent_tokenize
+import nltk
+nltk.download('punkt_tab')
 
 from datasets import load_dataset
 
 def load_huggingface_dataset():
+    # Load the dataset
     dataset = load_dataset("percins/IN-ABS")
     
+    # Save dataset with generated candidates
     data_paths = {
         "train": "/content/data/train.json",
         "validation": "/content/data/validation.json",
@@ -36,11 +41,26 @@ def load_huggingface_dataset():
         
         with open(path, "w") as f:
             for example in data:
-                # Include raw text and summary for metrics
+                article = example["text"]
+                summary = example["summary"]
+                
+                # Split the article into sentences
+                sentences = sent_tokenize(article)
+                
+                # Generate candidate summaries (first 1, 2, ..., 20 sentences)
+                candidates = []
+                for i in range(1, 21):  # Assume candidate_num=20
+                    if i <= len(sentences):
+                        candidate = " ".join(sentences[:i])
+                    else:
+                        candidate = " ".join(sentences)  # Use all sentences if too short
+                    candidates.append(candidate)
+                
+                # Save with the required format
                 formatted_example = {
-                    "src": example["text"],
-                    "candidates": example["candidates"],  # List of candidate summaries
-                    "summary": example["summary"]  # Ground truth summary
+                    "src": article,
+                    "candidates": candidates,  # Generated candidates
+                    "summary": summary  # Ground truth
                 }
                 json.dump(formatted_example, f)
                 f.write('\n')
