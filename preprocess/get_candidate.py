@@ -1,4 +1,5 @@
 import os
+import re
 import argparse
 from os.path import join, exists
 import subprocess as sp
@@ -14,210 +15,183 @@ from itertools import combinations
 from cytoolz import curry
 from pyrouge.utils import log
 from pyrouge import Rouge155
+from datasets import load_dataset
+from transformers import AutoTokenizer
+from datasets import load_dataset
 
-from transformers import BertTokenizer, RobertaTokenizer
-
-MAX_LEN = 512
-
+# Legal-specific configuration
+MAX_LEN = 1024  # Increased for legal document length
+_LEGAL_CITATION_PATTERN = r'\b(AIR \d{4} (SC|Ker|Bom|Cal|Mad|All) \d+\b'
 _ROUGE_PATH = '/path/to/RELEASE-1.5.5'
-temp_path = './temp' # path to store some temporary files
+temp_path = './legal_temp'  # Changed temp path for legal processing
 
 original_data, sent_ids = [], []
 
-def load_jsonl(data_path):
-    data = []
-    with open(data_path) as f:
-        for line in f:
-            data.append(json.loads(line))
-    return data
+def preprocess_legal_text(text):
+    """Clean and normalize legal text elements"""
+    text = re.sub(_LEGAL_CITATION_PATTERN, '[CITATION]', text)
+    text = re.sub(r'Sec(?:tion)?\.?\s+\d+[A-Za-z]*', '[SECTION]', text)
+    text = re.sub(r'\b(?:Petitioner|Respondent)s?\b', '[PARTY]', text)
+    return text
 
-def get_rouge(path, dec):
-    log.get_global_console_logger().setLevel(logging.WARNING)
-    dec_pattern = '(\d+).dec'
-    ref_pattern = '#ID#.ref'
-    dec_dir = join(path, 'decode')
-    ref_dir = join(path, 'reference')
-
-    with open(join(dec_dir, '0.dec'), 'w') as f:
-        for sentence in dec:
-            print(sentence, file=f)
-
-    cmd = '-c 95 -r 1000 -n 2 -m'
-    with tempfile.TemporaryDirectory() as tmp_dir:
-        Rouge155.convert_summaries_to_rouge_format(
-            dec_dir, join(tmp_dir, 'dec'))
-        Rouge155.convert_summaries_to_rouge_format(
-            ref_dir, join(tmp_dir, 'ref'))
-        Rouge155.write_config_static(
-            join(tmp_dir, 'dec'), dec_pattern,
-            join(tmp_dir, 'ref'), ref_pattern,
-            join(tmp_dir, 'settings.xml'), system_id=1
-        )
-        cmd = (join(_ROUGE_PATH, 'ROUGE-1.5.5.pl')
-            + ' -e {} '.format(join(_ROUGE_PATH, 'data'))
-            + cmd
-            + ' -a {}'.format(join(tmp_dir, 'settings.xml')))
-        output = sp.check_output(cmd.split(' '), universal_newlines=True)
-
-        line = output.split('\n')
-        rouge1 = float(line[3].split(' ')[3])
-        rouge2 = float(line[7].split(' ')[3])
-        rougel = float(line[11].split(' ')[3])
-    return (rouge1 + rouge2 + rougel) / 3
+def load_legal_data(data_path):
+    """Load IN-ABS dataset with legal preprocessing"""
+    dataset = load_dataset("percins/IN-ABS", split='train')
+    processed = []
+    for case in dataset:
+        processed.append({
+            'case': [preprocess_legal_text(sent) for sent in case['text']],
+            'summary': [preprocess_legal_text(sent) for sent in case['summary']]
+        })
+    return processed
 
 @curry
 def get_candidates(tokenizer, cls, sep_id, idx):
-
     idx_path = join(temp_path, str(idx))
     
-    # create some temporary files to calculate ROUGE
-    sp.call('mkdir ' + idx_path, shell=True)
-    sp.call('mkdir ' + join(idx_path, 'decode'), shell=True)
-    sp.call('mkdir ' + join(idx_path, 'reference'), shell=True)
+    # Create temporary directory structure
+    sp.call(f'mkdir -p {idx_path}', shell=True)
+    sp.call(f'mkdir -p {join(idx_path, "decode")}', shell=True)
+    sp.call(f'mkdir -p {join(idx_path, "reference")}', shell=True)
     
-    # load data
-    data = {}
-    data['text'] = original_data[idx]['text']
-    data['summary'] = original_data[idx]['summary']
+    # Load legal case data
+    data = {
+        'case': original_data[idx]['case'],
+        'summary': original_data[idx]['summary']
+    }
     
-    # write reference summary to temporary files
+    # Write reference summary
     ref_dir = join(idx_path, 'reference')
     with open(join(ref_dir, '0.ref'), 'w') as f:
         for sentence in data['summary']:
             print(sentence, file=f)
 
-    # get candidate summaries
-    # here is for CNN/DM: truncate each document into the 5 most important sentences (using BertExt), 
-    # then select any 2 or 3 sentences to form a candidate summary, so there are C(5,2)+C(5,3)=20 candidate summaries.
-    # if you want to process other datasets, you may need to adjust these numbers according to specific situation.
-    sent_id = sent_ids[idx]['sent_id'][:5]
-    indices = list(combinations(sent_id, 2))
-    indices += list(combinations(sent_id, 3))
-    if len(sent_id) < 2:
-        indices = [sent_id]
+    # Legal-specific candidate generation
+    sent_id = sent_ids[idx]['sent_id'][:8]  # Use top 8 sentences
+    indices = list(combinations(sent_id, 3))  # Minimum 3 sentences
+    indices += list(combinations(sent_id, 4))  # Add 4-sentence combinations
     
-    # get ROUGE score for each candidate summary and sort them in descending order
+    if len(sent_id) < 3:  # Handle short documents
+        indices = [sent_id] if len(sent_id) > 0 else []
+
+    # Score candidates with legal-aware ROUGE
     score = []
     for i in indices:
         i = list(i)
         i.sort()
-        # write dec
-        dec = []
-        for j in i:
-            sent = data['text'][j]
-            dec.append(sent)
+        dec = [data['case'][j] for j in i]
         score.append((i, get_rouge(idx_path, dec)))
-    score.sort(key=lambda x : x[1], reverse=True)
-    
-    # write candidate indices and score
-    data['ext_idx'] = sent_id
-    data['indices'] = []
-    data['score'] = []
-    for i, R in score:
-        data['indices'].append(list(map(int, i)))
-        data['score'].append(R)
+    score.sort(key=lambda x: x[1], reverse=True)
 
-    # tokenize and get candidate_id
+    # Store legal document metadata
+    data['court'] = original_data[idx].get('court', '')
+    data['year'] = original_data[idx].get('year', '')
+    data['ext_idx'] = sent_id
+    data['indices'] = [list(map(int, i)) for i, _ in score]
+    data['score'] = [r for _, r in score]
+
+    # Legal-specific tokenization
     candidate_summary = []
     for i in data['indices']:
         cur_summary = [cls]
         for j in i:
-            cur_summary += data['text'][j].split()
+            cur_summary += data['case'][j].split()
         cur_summary = cur_summary[:MAX_LEN]
-        cur_summary = ' '.join(cur_summary)
-        candidate_summary.append(cur_summary)
+        candidate_summary.append(' '.join(cur_summary))
     
     data['candidate_id'] = []
     for summary in candidate_summary:
-        token_ids = tokenizer.encode(summary, add_special_tokens=False)[:(MAX_LEN - 1)]
-        token_ids += sep_id
+        token_ids = tokenizer.encode(
+            summary, 
+            add_special_tokens=False,
+            truncation=True,
+            max_length=MAX_LEN-1
+        ) + sep_id
         data['candidate_id'].append(token_ids)
-    
-    # tokenize and get text_id
-    text = [cls]
-    for sent in data['text']:
-        text += sent.split()
-    text = text[:MAX_LEN]
-    text = ' '.join(text)
-    token_ids = tokenizer.encode(text, add_special_tokens=False)[:(MAX_LEN - 1)]
-    token_ids += sep_id
-    data['text_id'] = token_ids
-    
-    # tokenize and get summary_id
-    summary = [cls]
+
+    # Tokenize full case text
+    case_text = [cls]
+    for sent in data['case']:
+        case_text += sent.split()
+    case_text = ' '.join(case_text[:MAX_LEN])
+    data['text_id'] = tokenizer.encode(
+        case_text,
+        add_special_tokens=False,
+        truncation=True,
+        max_length=MAX_LEN-1
+    ) + sep_id
+
+    # Tokenize reference summary
+    ref_summary = [cls]
     for sent in data['summary']:
-        summary += sent.split()
-    summary = summary[:MAX_LEN]
-    summary = ' '.join(summary)
-    token_ids = tokenizer.encode(summary, add_special_tokens=False)[:(MAX_LEN - 1)]
-    token_ids += sep_id
-    data['summary_id'] = token_ids
-    
-    # write processed data to temporary file
+        ref_summary += sent.split()
+    ref_summary = ' '.join(ref_summary[:MAX_LEN])
+    data['summary_id'] = tokenizer.encode(
+        ref_summary,
+        add_special_tokens=False,
+        truncation=True,
+        max_length=MAX_LEN-1
+    ) + sep_id
+
+    # Save processed legal case
     processed_path = join(temp_path, 'processed')
-    with open(join(processed_path, '{}.json'.format(idx)), 'w') as f:
-        json.dump(data, f, indent=4) 
+    with open(join(processed_path, f'{idx}.json'), 'w') as f:
+        json.dump(data, f, indent=4)
     
-    sp.call('rm -r ' + idx_path, shell=True)
+    sp.call(f'rm -rf {idx_path}', shell=True)
 
 def get_candidates_mp(args):
-    
-    # choose tokenizer
-    if args.tokenizer == 'bert':
-        tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
-        cls, sep = '[CLS]', '[SEP]'
-    else:
-        tokenizer = RobertaTokenizer.from_pretrained('roberta-base')
-        cls, sep = '<s>', '</s>'
-    sep_id = tokenizer.encode(sep, add_special_tokens=False)
+    # Initialize legal tokenizer
+    tokenizer = AutoTokenizer.from_pretrained("nlpaueb/legal-bert-base-uncased")
+    sep = tokenizer.sep_token
+    sep_id = tokenizer.convert_tokens_to_ids(sep)
+    cls = tokenizer.cls_token
 
-    # load original data and indices
+    # Load legal data
     global original_data, sent_ids
-    original_data = load_jsonl(args.data_path)
-    sent_ids = load_jsonl(args.index_path)
-    n_files = len(original_data)
-    assert len(sent_ids) == len(original_data)
-    print('total {} documents'.format(n_files))
-    os.makedirs(temp_path)
-    processed_path = join(temp_path, 'processed')
-    os.makedirs(processed_path)
+    original_data = load_dataset("percins/IN-ABS", split='train')
+    sent_ids = load_dataset(args.index_path, split='train')
+    
+    print(f'Processing {len(original_data)} legal cases')
+    os.makedirs(temp_path, exist_ok=True)
+    os.makedirs(join(temp_path, 'processed'), exist_ok=True)
 
-    # use multi-processing to get candidate summaries
+    # Parallel processing for legal documents
     start = time()
-    print('start getting candidates with multi-processing !!!')
+    print('Starting legal candidate generation...')
     
     with mp.Pool() as pool:
-        list(pool.imap_unordered(get_candidates(tokenizer, cls, sep_id), range(n_files), chunksize=64))
+        pool.imap_unordered(
+            get_candidates(tokenizer, cls, sep_id),
+            range(len(original_data)),
+            chunksize=32  # Reduced for larger documents
+        )
     
-    print('finished in {}'.format(timedelta(seconds=time()-start)))
+    print(f'Completed in {timedelta(seconds=time()-start)}')
     
-    # write processed data
-    print('start writing {} files'.format(n_files))
-    for i in range(n_files):
-        with open(join(processed_path, '{}.json'.format(i))) as f:
-            data = json.loads(f.read())
-        with open(args.write_path, 'a') as f:
-            print(json.dumps(data), file=f)
+    # Aggregate results for legal dataset
+    print('Compiling final dataset...')
+    with open(args.write_path, 'w') as outfile:
+        for i in range(len(original_data)):
+            with open(join(temp_path, 'processed', f'{i}.json')) as f:
+                json.dump(json.load(f), outfile)
+                outfile.write('\n')
     
-    os.system('rm -r {}'.format(temp_path))
+    sp.call(f'rm -rf {temp_path}', shell=True)
 
 if __name__ == '__main__':
-    
     parser = argparse.ArgumentParser(
-        description='Process truncated documents to obtain candidate summaries'
+        description='Generate candidate summaries for legal cases'
     )
-    parser.add_argument('--tokenizer', type=str, required=True,
-        help='BERT/RoBERTa')
     parser.add_argument('--data_path', type=str, required=True,
-        help='path to the original dataset, the original dataset should contain text and summary')
+        help='Path to IN-ABS dataset directory')
     parser.add_argument('--index_path', type=str, required=True,
-        help='indices of the remaining sentences of the truncated document')
+        help='Path to sentence indices file')
     parser.add_argument('--write_path', type=str, required=True,
-        help='path to store the processed dataset')
-
+        help='Output path for processed legal candidates')
+    
     args = parser.parse_args()
-    assert args.tokenizer in ['bert', 'roberta']
-    assert exists(args.data_path)
-    assert exists(args.index_path)
-
+    # assert exists(args.data_path), "Dataset path not found"
+    # assert exists(args.index_path), "Index file not found"
+    
     get_candidates_mp(args)
