@@ -5,7 +5,7 @@ from tqdm import tqdm
 from torch.utils.data import Dataset, DataLoader
 from transformers import AutoTokenizer, AutoModel
 from datasets import load_dataset
-from torch.cuda.amp import autocast, GradScaler
+from torch.cuda.amp import autocast
 import multiprocessing as mp
 
 class LegalDataset(Dataset):
@@ -16,20 +16,18 @@ class LegalDataset(Dataset):
         return len(self.dataset)
     
     def __getitem__(self, idx):
-        return self.dataset[idx]
+        return {
+            "text": self.dataset[idx]["text"],
+            "file": self.dataset[idx]["file"]
+        }
 
 class LegalIndexGenerator:
     def __init__(self, model_name="nlpaueb/legal-bert-base-uncased"):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.model = AutoModel.from_pretrained(model_name).to(self.device)
-        self.model = torch.nn.DataParallel(self.model)  # Multi-GPU support
+        self.model = torch.nn.DataParallel(self.model)
         self.model.eval()
-        self.scaler = GradScaler()  # For mixed precision
-        
-        # Enable cudnn benchmarking and deterministic algorithms
-        torch.backends.cudnn.benchmark = True
-        torch.backends.cudnn.deterministic = True
 
     def _process_batch(self, batch):
         """Process batch of sentences with mixed precision"""
@@ -47,10 +45,9 @@ class LegalIndexGenerator:
 
     def _score_sentences(self, document):
         """Batch process sentences with optimal chunk size"""
-        batch_size = 256  # Adjusted for T4 memory
+        batch_size = 256
         scores = []
         
-        # Split document into batches
         for i in range(0, len(document), batch_size):
             batch = document[i:i+batch_size]
             batch_scores = self._process_batch(batch)
@@ -63,39 +60,36 @@ class LegalIndexGenerator:
         dataset = load_dataset("percins/IN-ABS", split="train")
         legal_dataset = LegalDataset(dataset)
         
-        # Configure DataLoader for parallel processing
         loader = DataLoader(
             legal_dataset,
-            batch_size=8,  # Documents per batch
+            batch_size=8,
             shuffle=False,
-            num_workers=mp.cpu_count()//2,  # Use half of available CPU cores
+            num_workers=mp.cpu_count()//2,
             pin_memory=True,
             prefetch_factor=2
         )
         
         indices = []
-        with torch.cuda.amp.autocast(), tqdm(total=len(legal_dataset)) as pbar:
+        with tqdm(total=len(legal_dataset)) as pbar:
             for batch in loader:
-                doc_batch = [doc["text"] for doc in batch]
-                # doc_ids = [doc["id"] for doc in batch]
+                # Extract text and file names from batch
+                doc_texts = [doc["text"] for doc in batch]
+                file_names = [doc["file"] for doc in batch]
                 
                 # Process documents in parallel
                 with mp.pool.ThreadPool() as pool:
-                    results = pool.map(self._score_sentences, doc_batch)
+                    results = pool.map(self._score_sentences, doc_texts)
                 
-                for doc_id, doc, scores in zip(doc_ids, doc_batch, results):
+                for file_name, doc_text, scores in zip(file_names, doc_texts, results):
                     ranked_indices = np.argsort(scores)[::-1][:top_k].tolist()
                     indices.append({
-                        # "doc_id": doc_id,
+                        "file": file_name,
                         "sent_id": ranked_indices,
                         "scores": [scores[i] for i in ranked_indices]
                     })
                 
                 pbar.update(len(batch))
-                
-                # Empty cache periodically
-                if len(indices) % 100 == 0:
-                    torch.cuda.empty_cache()
+                torch.cuda.empty_cache()
         
         # Save indices
         with open(output_path, "w") as f:
